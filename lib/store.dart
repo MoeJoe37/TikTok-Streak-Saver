@@ -1,0 +1,167 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// A TikTok person. [handle] (no @) when known, else only the inbox [name].
+class Person {
+  final String name;
+  final String? handle;
+  final String? avatar; // TikTok CDN url; signed, expires in ~a week, refreshed on use
+  const Person(this.name, [this.handle, this.avatar]);
+  String get key => handle ?? name;
+  Map<String, dynamic> toJson() => {'name': name, 'handle': handle, 'avatar': avatar};
+  factory Person.fromJson(Map m) => Person(m['name'], m['handle'], m['avatar']);
+}
+
+class Video {
+  final String url;
+  final String title;
+  final String? thumb;
+  const Video(this.url, this.title, [this.thumb]);
+  Map<String, dynamic> toJson() => {'url': url, 'title': title, 'thumb': thumb};
+  factory Video.fromJson(Map m) => Video(m['url'], m['title'], m['thumb']);
+}
+
+Future<Map?> _oembed(String url) async {
+  try {
+    final c = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+    final res = await (await c.getUrl(Uri.parse(
+            'https://www.tiktok.com/oembed?url=${Uri.encodeComponent(url)}')))
+        .close();
+    return jsonDecode(await res.transform(utf8.decoder).join()) as Map;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Short share links (vt./vm.tiktok.com) bounce through app-link redirects that
+/// a WebView can fail on; the full @author/video/id page loads reliably.
+Future<String> canonicalVideoUrl(String url) async {
+  final m = await _oembed(url);
+  final a = m?['author_unique_id'], id = m?['embed_product_id'];
+  return a != null && id != null ? 'https://www.tiktok.com/@$a/video/$id?lang=en' : url;
+}
+
+String dayKey(DateTime d) => '${d.year}-${d.month}-${d.day}';
+
+/// Who gets which video right now. Skips people already sent to today;
+/// assigned videos win, otherwise a random library video.
+Map<Person, String> planSends(List<Person> people, List<Video> library,
+    Map<String, List<String>> assigned, Map<String, String> sentOn, DateTime now,
+    [Random? rng]) {
+  rng ??= Random();
+  final out = <Person, String>{};
+  if (library.isEmpty) return out;
+  for (final p in people) {
+    if (sentOn[p.key] == dayKey(now)) continue;
+    final pool = (assigned[p.key] ?? const <String>[])
+        .where((u) => library.any((v) => v.url == u))
+        .toList();
+    out[p] = pool.isNotEmpty
+        ? pool[rng.nextInt(pool.length)]
+        : library[rng.nextInt(library.length)].url;
+  }
+  return out;
+}
+
+class Store extends ChangeNotifier {
+  late SharedPreferences _p;
+  List<Person> people = [];
+  List<Video> videos = [];
+  Map<String, List<String>> assigned = {};
+  Map<String, String> sentOn = {};
+  List<String> log = [];
+  int hour = 20, minute = 0;
+  bool enabled = false;
+
+  static Future<Store> load() async {
+    final s = Store().._p = await SharedPreferences.getInstance();
+    await s.reload();
+    return s;
+  }
+
+  /// Re-reads disk; the alarm isolate writes the same prefs.
+  Future<void> reload() async {
+    final s = this;
+    await _p.reload();
+    final j = jsonDecode(_p.getString('state') ?? '{}') as Map;
+    s.people = [for (final m in j['people'] ?? []) Person.fromJson(m)];
+    s.videos = [for (final m in j['videos'] ?? []) Video.fromJson(m)];
+    s.assigned = {
+      for (final e in (j['assigned'] as Map? ?? {}).entries)
+        e.key as String: List<String>.from(e.value)
+    };
+    s.sentOn = Map<String, String>.from(j['sentOn'] ?? {});
+    s.log = List<String>.from(j['log'] ?? []);
+    s.hour = j['hour'] ?? 20;
+    s.minute = j['minute'] ?? 0;
+    s.enabled = j['enabled'] ?? false;
+    notifyListeners();
+  }
+
+  Future<void> save() async {
+    await _p.setString(
+        'state',
+        jsonEncode({
+          'people': people,
+          'videos': videos,
+          'assigned': assigned,
+          'sentOn': sentOn,
+          'log': log,
+          'hour': hour,
+          'minute': minute,
+          'enabled': enabled,
+        }));
+    notifyListeners();
+  }
+
+  void togglePerson(Person p) {
+    final i = people.indexWhere((x) => x.key == p.key);
+    i >= 0 ? people.removeAt(i) : people.add(p);
+    save();
+  }
+
+  bool has(Person p) => people.any((x) => x.key == p.key);
+
+  /// Refreshes stored avatars from fresh [seen] people (matched by key).
+  void updateAvatars(Iterable<Person> seen) {
+    for (final s in seen) {
+      final i = people.indexWhere((x) => x.key == s.key);
+      if (i >= 0 && s.avatar != null && people[i].avatar != s.avatar) {
+        people[i] = Person(people[i].name, people[i].handle, s.avatar);
+      }
+    }
+    save();
+  }
+
+  void addLog(String line) {
+    final t = DateTime.now();
+    log.insert(0,
+        '${t.month}/${t.day} ${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}  $line');
+    if (log.length > 60) log.removeLast();
+  }
+
+  /// Uses TikTok's public oEmbed for a title + thumbnail; falls back to the bare link.
+  Future<void> addVideo(String url) async {
+    url = url.trim();
+    if (!url.contains('tiktok.com') || videos.any((v) => v.url == url)) return;
+    var v = Video(url, url.replaceFirst(RegExp(r'^https?://(www\.)?'), ''));
+    final m = await _oembed(url);
+    if (m != null) {
+      v = Video(url, (m['title'] as String?)?.trim().isNotEmpty == true ? m['title'] : '@${m['author_unique_id']}', m['thumbnail_url']);
+    }
+    videos.add(v);
+    save();
+  }
+
+  void removeVideo(Video v) {
+    videos.remove(v);
+    for (final l in assigned.values) {
+      l.remove(v.url);
+    }
+    save();
+  }
+}
