@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ui';
 
 import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
@@ -203,6 +204,7 @@ Future<void> runStreaks(Store s) async {
     return s.save();
   }
   final p = _Page();
+  await _keepAlive('start');
   try {
     await p.open(inboxUrl);
     for (final MapEntry(key: person, value: url) in plan.entries) {
@@ -256,13 +258,21 @@ Future<void> runStreaks(Store s) async {
     await s.save();
   } finally {
     await p.close();
+    await _keepAlive('stop');
   }
+}
+
+/// Foreground service around a run, else Android kills the alarm's process mid-run
+/// (see packages/keep_alive). A refused start still runs; it just may be cut short.
+Future<void> _keepAlive(String method) async {
+  try {
+    await const MethodChannel('streak_saver/keep_alive').invokeMethod(method);
+  } catch (_) {}
 }
 
 @pragma('vm:entry-point')
 Future<void> alarmCallback() async {
-  // ponytail: headless WebView from the alarm isolate; if a ROM kills it,
-  // move this into a foreground service.
+  // Headless WebView from the alarm isolate; runStreaks holds a foreground service.
   WidgetsFlutterBinding.ensureInitialized();
   DartPluginRegistrant.ensureInitialized();
   final s = await Store.load();

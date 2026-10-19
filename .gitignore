@@ -49,3 +49,4 @@ app.*.map.json
 
 # Local copies of built APKs
 /release/
+.serena/

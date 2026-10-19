@@ -23,18 +23,56 @@ class Video {
   const Video(this.url, this.title, [this.thumb]);
   Map<String, dynamic> toJson() => {'url': url, 'title': title, 'thumb': thumb};
   factory Video.fromJson(Map m) => Video(m['url'], m['title'], m['thumb']);
+
+  /// No thumbnail yet, or its signed CDN url expires within the hour (they last ~2 days).
+  bool get stale {
+    final exp = int.tryParse(Uri.tryParse(thumb ?? '')?.queryParameters['x-expires'] ?? '');
+    return thumb == null ||
+        (exp != null && DateTime.fromMillisecondsSinceEpoch(exp * 1000)
+            .isBefore(DateTime.now().add(const Duration(hours: 1))));
+  }
 }
 
-Future<Map?> _oembed(String url) async {
+final _http = HttpClient()
+  ..connectionTimeout = const Duration(seconds: 6)
+  ..userAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+Future<Map?> _oembedOnce(String url) async {
   try {
-    final c = HttpClient()..connectionTimeout = const Duration(seconds: 6);
-    final res = await (await c.getUrl(Uri.parse(
+    final res = await (await _http.getUrl(Uri.parse(
             'https://www.tiktok.com/oembed?url=${Uri.encodeComponent(url)}')))
         .close();
-    return jsonDecode(await res.transform(utf8.decoder).join()) as Map;
+    final m = jsonDecode(await res.transform(utf8.decoder).join());
+    return m is Map && m['thumbnail_url'] != null ? m : null; // errors come back as JSON too
   } catch (_) {
     return null;
   }
+}
+
+/// Follows a short share link (vt./vm.tiktok.com, tiktok.com/t/) to the full video url.
+Future<String> _expand(String url) async {
+  try {
+    final res = await (await _http.getUrl(Uri.parse(url))).close();
+    res.drain<void>().ignore();
+    return res.redirects.isEmpty
+        ? url
+        : Uri.parse(url).resolveUri(res.redirects.last.location).toString();
+  } catch (_) {
+    return url;
+  }
+}
+
+/// TikTok's oEmbed is slow and flaky (seen: 14s replies, 400s for short links): bounded
+/// tries, switching to the expanded link after the first miss.
+Future<Map?> _oembed(String url) async {
+  for (var i = 0; i < 3; i++) {
+    if (i == 1) url = await _expand(url).timeout(const Duration(seconds: 15), onTimeout: () => url);
+    final m = await _oembedOnce(url).timeout(const Duration(seconds: 20), onTimeout: () => null);
+    if (m != null) return m;
+    await Future.delayed(Duration(seconds: i + 1));
+  }
+  return null;
 }
 
 /// Short share links (vt./vm.tiktok.com) bounce through app-link redirects that
@@ -144,17 +182,30 @@ class Store extends ChangeNotifier {
     if (log.length > 60) log.removeLast();
   }
 
-  /// Uses TikTok's public oEmbed for a title + thumbnail; falls back to the bare link.
+  /// Shows the bare link at once, then fills in title + thumbnail.
   Future<void> addVideo(String url) async {
     url = url.trim();
     if (!url.contains('tiktok.com') || videos.any((v) => v.url == url)) return;
-    var v = Video(url, url.replaceFirst(RegExp(r'^https?://(www\.)?'), ''));
-    final m = await _oembed(url);
-    if (m != null) {
-      v = Video(url, (m['title'] as String?)?.trim().isNotEmpty == true ? m['title'] : '@${m['author_unique_id']}', m['thumbnail_url']);
+    videos.add(Video(url, url.replaceFirst(RegExp(r'^https?://(www\.)?'), '')));
+    await save();
+    await _fill(url);
+  }
+
+  /// Retries videos whose info never loaded and renews thumbnails before they expire.
+  Future<void> refreshVideos() async {
+    for (final v in videos.where((v) => v.stale).toList()) {
+      await _fill(v.url);
     }
-    videos.add(v);
-    save();
+  }
+
+  /// Title + thumbnail from TikTok's public oEmbed; keeps what's there if it can't be reached.
+  Future<void> _fill(String url) async {
+    final m = await _oembed(url);
+    final i = videos.indexWhere((v) => v.url == url); // may have been removed meanwhile
+    if (m == null || i < 0) return;
+    final t = (m['title'] as String?)?.trim() ?? '';
+    videos[i] = Video(url, t.isNotEmpty ? t : '@${m['author_unique_id']}', m['thumbnail_url']);
+    await save();
   }
 
   void removeVideo(Video v) {

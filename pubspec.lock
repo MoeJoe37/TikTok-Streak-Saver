@@ -176,6 +176,13 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  keep_alive:
+    dependency: "direct main"
+    description:
+      path: "packages/keep_alive"
+      relative: true
+    source: path
+    version: "1.0.0"
   leak_tracker:
     dependency: transitive
     description:

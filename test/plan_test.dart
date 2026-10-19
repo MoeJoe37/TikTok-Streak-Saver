@@ -16,4 +16,13 @@ void main() {
     expect(planSends([a], const [], {}, {}, now), isEmpty);
     expect(planSends([c], lib, {}, {'cy': '2026-10-17'}, now).keys, [c]); // yesterday doesn't count
   });
+
+  test('Video.stale: missing or soon-expiring thumbnail', () {
+    String at(Duration d) =>
+        'https://p16.tiktokcdn.com/x.image?x-expires=${DateTime.now().add(d).millisecondsSinceEpoch ~/ 1000}&x-signature=s';
+    expect(const Video('u', 't').stale, isTrue);
+    expect(Video('u', 't', at(const Duration(days: 2))).stale, isFalse);
+    expect(Video('u', 't', at(const Duration(minutes: 10))).stale, isTrue);
+    expect(const Video('u', 't', 'https://cdn/x.jpg').stale, isFalse); // unsigned: never expires
+  });
 }

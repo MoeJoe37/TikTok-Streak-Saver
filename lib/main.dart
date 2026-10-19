@@ -14,6 +14,7 @@ Future<void> main() async {
   await AndroidAlarmManager.initialize();
   store = await Store.load();
   await schedule(store); // app updates wipe alarms; re-book on every launch
+  store.refreshVideos(); // background; tiles update as info arrives
   runApp(App(loggedIn: await isLoggedIn()));
 }
 
@@ -140,7 +141,7 @@ class Home extends StatefulWidget {
 class _HomeState extends State<Home> {
   int tab = 0;
   late final _life = AppLifecycleListener(onResume: () {
-    store.reload();
+    store.reload().then((_) => store.refreshVideos());
     checkBlockers(); // user may be back from a settings page
   });
 
