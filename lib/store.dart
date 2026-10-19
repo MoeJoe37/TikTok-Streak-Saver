@@ -5,6 +5,8 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'tiktok.dart' show videoInfoFromPage;
+
 /// A TikTok person. [handle] (no @) when known, else only the inbox [name].
 class Person {
   final String name;
@@ -63,24 +65,25 @@ Future<String> _expand(String url) async {
   }
 }
 
-/// TikTok's oEmbed is slow and flaky (seen: 14s replies, 400s for short links): bounded
-/// tries, switching to the expanded link after the first miss.
-Future<Map?> _oembed(String url) async {
-  for (var i = 0; i < 3; i++) {
-    if (i == 1) url = await _expand(url).timeout(const Duration(seconds: 15), onTimeout: () => url);
-    final m = await _oembedOnce(url).timeout(const Duration(seconds: 20), onTimeout: () => null);
-    if (m != null) return m;
-    await Future.delayed(Duration(seconds: i + 1));
-  }
-  return null;
+var _gate = Future<void>.value();
+
+/// TikTok's oEmbed is slow (seen: 14s replies) and rate-limits per IP (seen: 429 on mobile
+/// data for minutes at a time), so every call is queued app-wide, 3s apart.
+Future<Map?> _paced(String url) {
+  final r = _gate.then((_) =>
+      _oembedOnce(url).timeout(const Duration(seconds: 20), onTimeout: () => null));
+  _gate = r.then((_) => Future.delayed(const Duration(seconds: 3)));
+  return r;
 }
 
 /// Short share links (vt./vm.tiktok.com) bounce through app-link redirects that
 /// a WebView can fail on; the full @author/video/id page loads reliably.
 Future<String> canonicalVideoUrl(String url) async {
-  final m = await _oembed(url);
+  final m = await _paced(url);
   final a = m?['author_unique_id'], id = m?['embed_product_id'];
-  return a != null && id != null ? 'https://www.tiktok.com/@$a/video/$id?lang=en' : url;
+  return a != null && id != null
+      ? 'https://www.tiktok.com/@$a/video/$id?lang=en'
+      : await _expand(url).timeout(const Duration(seconds: 15), onTimeout: () => url);
 }
 
 String dayKey(DateTime d) => '${d.year}-${d.month}-${d.day}';
@@ -191,16 +194,21 @@ class Store extends ChangeNotifier {
     await _fill(url);
   }
 
-  /// Retries videos whose info never loaded and renews thumbnails before they expire.
-  Future<void> refreshVideos() async {
-    for (final v in videos.where((v) => v.stale).toList()) {
-      await _fill(v.url);
-    }
-  }
+  Future<void>? _refreshing;
 
-  /// Title + thumbnail from TikTok's public oEmbed; keeps what's there if it can't be reached.
+  /// Retries videos whose info never loaded and renews thumbnails before they expire.
+  /// One pass at a time; launch and resume both call this.
+  Future<void> refreshVideos() => _refreshing ??= () async {
+        for (final v in videos.where((v) => v.stale).toList()) {
+          await _fill(v.url);
+        }
+      }()
+          .whenComplete(() => _refreshing = null);
+
+  /// Title + thumbnail from TikTok's public oEmbed, else from the video page;
+  /// keeps what's there if neither works (refreshVideos retries later).
   Future<void> _fill(String url) async {
-    final m = await _oembed(url);
+    final m = await _paced(url) ?? await videoInfoFromPage(url);
     final i = videos.indexWhere((v) => v.url == url); // may have been removed meanwhile
     if (m == null || i < 0) return;
     final t = (m['title'] as String?)?.trim() ?? '';

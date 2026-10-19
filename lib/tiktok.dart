@@ -138,22 +138,27 @@ const ss = {
 class _Page {
   HeadlessInAppWebView? _h;
   InAppWebViewController? _c;
+  var _loaded = Completer<void>();
 
   Future<void> open(String url) async {
-    final ready = Completer<void>();
     _h = HeadlessInAppWebView(
       initialUrlRequest: URLRequest(url: WebUri(url)),
       initialSettings: webSettings,
       initialSize: const Size(1280, 900),
       onWebViewCreated: (c) => _c = c,
-      onLoadStop: (_, _) => ready.isCompleted ? null : ready.complete(),
+      onLoadStop: (_, _) => _loaded.isCompleted ? null : _loaded.complete(),
     );
     await _h!.run();
-    await ready.future.timeout(const Duration(seconds: 45));
+    await _loaded.future.timeout(const Duration(seconds: 45));
   }
 
-  Future<void> go(String url) =>
-      _c!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+  /// Waits for the new page: loadUrl returns at once, and polling the old page made
+  /// steps act on it (seen: a stale inbox clicked, then inChat timing out).
+  Future<void> go(String url) async {
+    final loaded = _loaded = Completer();
+    await _c!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+    await loaded.future.timeout(const Duration(seconds: 30), onTimeout: () {});
+  }
 
   // callAsyncJavaScript never resolves if the page navigates mid-call.
   Future<dynamic> js(String expr) async => (await _c!
@@ -188,6 +193,44 @@ Future<List<Person>> fetchInbox() async {
   }
 }
 
+/// Title + thumbnail read off the video page itself, for when oEmbed is rate-limited
+/// (mobile data shares one IP across many users). Same keys as oEmbed.
+Future<Map?> videoInfoFromPage(String url) async {
+  final p = _Page();
+  try {
+    await p.open(url);
+    return await p.until(r'''(() => {
+      let it = null;
+      try {
+        it = JSON.parse($('#__UNIVERSAL_DATA_FOR_REHYDRATION__').textContent)
+          .__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct;
+      } catch (e) {}
+      const og = k => ($('meta[property="og:' + k + '"]') || {}).content;
+      const thumb = (it && it.video && (it.video.cover || it.video.originCover)) || og('image');
+      return thumb ? {title: (it && it.desc) || og('title') || '',
+        thumbnail_url: thumb, author_unique_id: it && it.author && it.author.uniqueId} : null;
+    })()''', secs: 25) as Map;
+  } catch (_) {
+    return null;
+  } finally {
+    await p.close();
+  }
+}
+
+/// Opens [person]'s chat: their profile's Message button when the handle is known,
+/// else their row in the inbox. (Inbox-only people's profiles can lack the button.)
+Future<void> _openChat(_Page p, Person person) async {
+  if (person.handle != null) {
+    await p.go('https://www.tiktok.com/@${person.handle}?lang=en');
+    await p.until('ss.clickMessage()');
+  } else {
+    await p.go(inboxUrl);
+    await p.until('ss.openByName(${jsonEncode(person.name)})');
+  }
+  await p.until('ss.inChat(${jsonEncode(person.handle)}, ${jsonEncode(person.name)})');
+  await Future.delayed(const Duration(seconds: 2)); // let history render
+}
+
 /// Sends to everyone in the plan who hasn't been messaged today.
 Future<void> runStreaks(Store s) async {
   final plan = planSends(s.people, s.videos, s.assigned, s.sentOn, DateTime.now());
@@ -210,15 +253,7 @@ Future<void> runStreaks(Store s) async {
     for (final MapEntry(key: person, value: url) in plan.entries) {
       final who = person.handle != null ? '@${person.handle}' : person.name;
       try {
-        if (person.handle != null) {
-          await p.go('https://www.tiktok.com/@${person.handle}?lang=en');
-          await p.until('ss.clickMessage()');
-        } else {
-          await p.go(inboxUrl);
-          await p.until('ss.openByName(${jsonEncode(person.name)})');
-        }
-        await p.until('ss.inChat(${jsonEncode(person.handle)}, ${jsonEncode(person.name)})');
-        await Future.delayed(const Duration(seconds: 2)); // let history render
+        await _openChat(p, person);
         final pic = await p.js('ss.chatAvatar()');
         if (pic is String) s.updateAvatars([Person(person.name, person.handle, pic)]);
         if (await p.js('ss.sentToday()') == true) {
@@ -235,10 +270,7 @@ Future<void> runStreaks(Store s) async {
           await p.until('ss.openShare()');
           r = await p.js('ss.shareTo(${jsonEncode(handle)})') as String;
         } catch (_) {}
-        await p.go('https://www.tiktok.com/@$handle?lang=en');
-        await p.until('ss.clickMessage()');
-        await p.until('ss.inChat(${jsonEncode(handle)}, null)');
-        await Future.delayed(const Duration(seconds: 2));
+        await _openChat(p, person);
         if (await p.js('ss.sentToday()') == true) {
           s.sentOn[person.key] = dayKey(DateTime.now());
           s.addLog('$who: video shared.');
