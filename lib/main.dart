@@ -346,18 +346,20 @@ class VideosTab extends StatelessWidget {
   const VideosTab({super.key});
 
   Future<void> _remove(BuildContext context, Video v) async {
-    final ok = await showDialog<bool>(
+    final pick = await showDialog<String>(
       context: context,
       builder: (c) => AlertDialog(
         title: const Text('Remove this video?'),
         content: Text(v.title, maxLines: 3, overflow: TextOverflow.ellipsis),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Remove')),
+          TextButton(onPressed: () => Navigator.pop(c, 'open'), child: const Text('Open in TikTok')),
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(c, 'remove'), child: const Text('Remove')),
         ],
       ),
     );
-    if (ok == true) store.removeVideo(v);
+    if (pick == 'remove') store.removeVideo(v);
+    if (pick == 'open') _blockerChannel.invokeMethod('open', v.url);
   }
 
   void _pick(BuildContext context, Person p) => showModalBottomSheet(
@@ -527,12 +529,46 @@ class _VideoTile extends StatelessWidget {
 class ScheduleTab extends StatelessWidget {
   const ScheduleTab({super.key});
 
+  /// The time (opens the clock) plus a "Send at random time" checkbox.
   Future<void> _pickTime(BuildContext context) async {
-    final t = await showTimePicker(context: context, initialTime: TimeOfDay(hour: store.hour, minute: store.minute));
-    if (t == null) return;
+    var t = TimeOfDay(hour: store.hour, minute: store.minute);
+    var random = store.randomTime;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (c, set) => AlertDialog(
+          title: const Text('Daily check time'),
+          contentPadding: const EdgeInsets.fromLTRB(12, 16, 12, 0),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            ListTile(
+              enabled: !random,
+              leading: const Icon(Icons.schedule_rounded),
+              title: Text(t.format(c), style: Theme.of(c).textTheme.headlineSmall),
+              trailing: const Icon(Icons.edit_outlined),
+              onTap: () async {
+                final picked = await showTimePicker(context: c, initialTime: t);
+                if (picked != null) set(() => t = picked);
+              },
+            ),
+            CheckboxListTile(
+              value: random,
+              onChanged: (v) => set(() => random = v!),
+              title: const Text('Send at random time'),
+              subtitle: const Text('A different time for each person, every day, between 9 AM and 11 PM.'),
+            ),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+            TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Save')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
     store
       ..hour = t.hour
-      ..minute = t.minute;
+      ..minute = t.minute
+      ..randomTime = random;
     await store.save();
     await schedule(store);
   }
@@ -552,7 +588,7 @@ class ScheduleTab extends StatelessWidget {
     return ListenableBuilder(
       listenable: Listenable.merge([store, running, blockers]),
       builder: (context, _) {
-        final time = TimeOfDay(hour: store.hour, minute: store.minute).format(context);
+        final time = store.randomTime ? 'Random' : TimeOfDay(hour: store.hour, minute: store.minute).format(context);
         final issues = [
           if (store.people.isEmpty) 'Add at least one person.',
           if (store.videos.isEmpty) 'Add at least one video.',
@@ -578,7 +614,9 @@ class ScheduleTab extends StatelessWidget {
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Daily check'),
-            subtitle: Text('At $time, send a video to anyone you have not messaged today.'),
+            subtitle: Text(store.randomTime
+                ? 'At a random time for each person, send a video to anyone you have not messaged today.'
+                : 'At $time, send a video to anyone you have not messaged today.'),
             value: store.enabled,
             onChanged: (v) async {
               store.enabled = v;
@@ -625,7 +663,17 @@ class ScheduleTab extends StatelessWidget {
             label: Text(running.value ? 'Checking' : 'Check now'),
           ),
           const SizedBox(height: 32),
-          const _Label('Activity'),
+          Row(children: [
+            const Expanded(child: _Label('Activity')),
+            if (store.log.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: TextButton.icon(
+                    onPressed: store.clearLog,
+                    icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                    label: const Text('Clear log')),
+              ),
+          ]),
           if (store.log.isEmpty)
             Text('Nothing yet. Each run shows up here.', style: TextStyle(color: cs.onSurfaceVariant))
           else

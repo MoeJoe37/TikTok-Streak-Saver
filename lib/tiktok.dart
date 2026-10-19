@@ -231,9 +231,9 @@ Future<void> _openChat(_Page p, Person person) async {
   await Future.delayed(const Duration(seconds: 2)); // let history render
 }
 
-/// Sends to everyone in the plan who hasn't been messaged today.
-Future<void> runStreaks(Store s) async {
-  final plan = planSends(s.people, s.videos, s.assigned, s.sentOn, DateTime.now());
+/// Sends to everyone in the plan (or just [only]) who hasn't been messaged today.
+Future<void> runStreaks(Store s, [List<Person>? only]) async {
+  final plan = planSends(only ?? s.people, s.videos, s.assigned, s.sentOn, DateTime.now());
   if (s.people.isEmpty || s.videos.isEmpty) {
     s.addLog('Skipped: add at least one person and one video.');
     return s.save();
@@ -309,8 +309,11 @@ Future<void> alarmCallback() async {
   DartPluginRegistrant.ensureInitialized();
   final s = await Store.load();
   if (!s.enabled) return;
-  await schedule(s); // book tomorrow first, so a crash below can't break the chain
-  await runStreaks(s);
+  await schedule(s); // book the next one first, so a crash below can't break the chain
+  if (!s.randomTime) return runStreaks(s);
+  final now = DateTime.now(); // random mode: only people whose slot has come
+  final due = [for (final p in s.people) if (!randomSlot(p, now).isAfter(now)) p];
+  if (due.isNotEmpty) await runStreaks(s, due);
 }
 
 Future<void> schedule(Store s) async {
@@ -319,7 +322,8 @@ Future<void> schedule(Store s) async {
   final now = DateTime.now();
   var at = DateTime(now.year, now.month, now.day, s.hour, s.minute);
   if (!at.isAfter(now)) at = at.add(const Duration(days: 1));
-  // One exact alarm per day, re-booked by alarmCallback. periodic() uses
+  if (s.randomTime) at = nextRandomAlarm(s.people, s.sentOn, now);
+  // One exact alarm at a time, re-booked by alarmCallback. periodic() uses
   // setRepeating, which Android treats as inexact (observed: 18h window).
   await AndroidAlarmManager.oneShotAt(at, 0, alarmCallback,
       exact: true, wakeup: true, allowWhileIdle: true, rescheduleOnReboot: true);

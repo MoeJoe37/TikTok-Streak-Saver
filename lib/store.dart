@@ -5,7 +5,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'tiktok.dart' show videoInfoFromPage;
+import 'tiktok.dart' show schedule, videoInfoFromPage;
 
 /// A TikTok person. [handle] (no @) when known, else only the inbox [name].
 class Person {
@@ -88,6 +88,34 @@ Future<String> canonicalVideoUrl(String url) async {
 
 String dayKey(DateTime d) => '${d.year}-${d.month}-${d.day}';
 
+/// Random-time mode: [p]'s send time on [day], 9:00 to 23:00. Seeded by day + person,
+/// so it differs per person and per day but every recompute agrees (nothing stored).
+DateTime randomSlot(Person p, DateTime day) {
+  var h = 0;
+  for (final c in '${dayKey(day)}|${p.key}'.codeUnits) {
+    h = (h * 31 + c) & 0x7fffffff;
+  }
+  return DateTime(day.year, day.month, day.day, 9)
+      .add(Duration(minutes: Random(h).nextInt(14 * 60)));
+}
+
+/// Next alarm in random mode: the earliest slot still ahead (today's only for people not
+/// yet sent to), at least 10 min out so runs don't overlap; slots it skips past are due
+/// at that run. ponytail: a slot missed entirely (phone off) waits for a later slot today.
+DateTime nextRandomAlarm(List<Person> people, Map<String, String> sentOn, DateTime now) {
+  final tomorrow = DateTime(now.year, now.month, now.day + 1);
+  final ahead = [
+    for (final p in people) ...[
+      if (sentOn[p.key] != dayKey(now)) randomSlot(p, now),
+      randomSlot(p, tomorrow),
+    ]
+  ].where((t) => t.isAfter(now)).toList()
+    ..sort();
+  if (ahead.isEmpty) return tomorrow.add(const Duration(hours: 9)); // no people: look again then
+  final soonest = now.add(const Duration(minutes: 10));
+  return ahead.first.isBefore(soonest) ? soonest : ahead.first;
+}
+
 /// Who gets which video right now. Skips people already sent to today;
 /// assigned videos win, otherwise a random library video.
 Map<Person, String> planSends(List<Person> people, List<Video> library,
@@ -116,7 +144,7 @@ class Store extends ChangeNotifier {
   Map<String, String> sentOn = {};
   List<String> log = [];
   int hour = 20, minute = 0;
-  bool enabled = false;
+  bool enabled = false, randomTime = false;
 
   static Future<Store> load() async {
     final s = Store().._p = await SharedPreferences.getInstance();
@@ -140,6 +168,7 @@ class Store extends ChangeNotifier {
     s.hour = j['hour'] ?? 20;
     s.minute = j['minute'] ?? 0;
     s.enabled = j['enabled'] ?? false;
+    s.randomTime = j['randomTime'] ?? false;
     notifyListeners();
   }
 
@@ -155,6 +184,7 @@ class Store extends ChangeNotifier {
           'hour': hour,
           'minute': minute,
           'enabled': enabled,
+          'randomTime': randomTime,
         }));
     notifyListeners();
   }
@@ -162,6 +192,11 @@ class Store extends ChangeNotifier {
   void togglePerson(Person p) {
     final i = people.indexWhere((x) => x.key == p.key);
     i >= 0 ? people.removeAt(i) : people.add(p);
+    save().then((_) => schedule(this)); // random-mode slots depend on who's in
+  }
+
+  void clearLog() {
+    log.clear();
     save();
   }
 

@@ -14,7 +14,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
-// Finds and opens the settings that can stop the daily background send.
+// Finds and opens the settings that can stop the daily background send; also opens links.
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
@@ -23,6 +23,13 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "check" -> result.success(blockers())
                     "fix" -> result.success(fix(call.arguments as String))
+                    // TikTok claims its links, so a video url opens in the app (else the browser).
+                    "open" -> result.success(try {
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(call.arguments as String)))
+                        true
+                    } catch (_: Exception) {
+                        false
+                    })
                     else -> result.notImplemented()
                 }
             }
